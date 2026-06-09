@@ -1,0 +1,20 @@
+{
+  "name": "gbi-bec-youtube-live-sync",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "poc": "tsx src/live-poc.ts"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.16.0",
+    "@google/genai": "^0.14.0",
+    "dotenv": "^17.0.0",
+    "firebase-admin": "^13.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.0.0",
+    "typescript": "^5"
+  }
+}
