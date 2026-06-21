@@ -7,11 +7,9 @@
 #   - Required env vars: ASI1_API_KEY
 #
 # Schedules (Asia/Jakarta = WIB):
-#   service 1: 07:20  (cron: 20 7 * * 0)   — service starts 07:00, sermon ~20 min in
-#   service 2: 09:20  (cron: 20 9 * * 0)
-#   service 3: 11:35  (cron: 35 11 * * 0)  — service starts 11:15
-#   service 4: 15:20  (cron: 20 15 * * 0)
-#   service 5: 17:20  (cron: 20 17 * * 0)  — BEC Evening Church
+#   service 5: 17:30  (cron: 30 17 * * 0)  — BEC Evening Church (the only one we capture)
+#
+# Services 1-4 (morning) were removed Jun 21 2026 — BEC primary service is evening.
 #
 # Run: bash deploy.sh
 
@@ -94,11 +92,7 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 # 6) Five Cloud Schedulers — each with its own SERVICE_NUMBER override
 RUN_URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/$JOB_NAME:run"
 declare -a SCHEDULES=(
-  "1|20 7 * * 0"
-  "2|20 9 * * 0"
-  "3|35 11 * * 0"
-  "4|20 15 * * 0"
-  "5|20 17 * * 0"
+  "5|30 17 * * 0"
 )
 
 for entry in "${SCHEDULES[@]}"; do
