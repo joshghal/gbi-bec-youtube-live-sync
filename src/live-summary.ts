@@ -54,6 +54,9 @@ const WRITE_FIRESTORE = process.env.WRITE_FIRESTORE === '1';                    
 const SERVICE_NUMBER = process.env.SERVICE_NUMBER;                              // passed by sunday-runner via inheritance
 const SERMON_DATE = process.env.SERMON_DATE;                                    // YYYY-MM-DD WIB — passed by sunday-runner
 const VIDEO_TITLE = process.env.VIDEO_TITLE;                                    // raw YouTube title — passed by sunday-runner
+const PORTAL_URL = process.env.PORTAL_URL ?? 'https://www.gbibec.id';           // portal base for automation callbacks
+const INTERNAL_WEBHOOK_SECRET = process.env.INTERNAL_WEBHOOK_SECRET;            // shared secret for those callbacks
+const PORTAL_TIMEOUT_MS = parseInt(process.env.PORTAL_TIMEOUT_MS ?? '120000', 10); // publish chain runs Gemini — allow 2 min
 mkdirSync(OUTPUT_DIR, { recursive: true });
 
 if (!URL || !GEMINI_KEY || !ASI1_KEY) {
@@ -179,6 +182,37 @@ function computeIdentity() {
     : `${basename(OUTPUT_DIR)}/transcript.txt`;
   const gcsTranscriptUri = GCS_BUCKET ? `gs://${GCS_BUCKET}/${remotePath}` : '';
   return { videoId, docId, gcsTranscriptUri };
+}
+
+// ── Portal callbacks ────────────────────────────────────────────────
+// The portal owns WhatsApp, the notetaker form and the publish chain; this job
+// only tells it *when*. Authenticated with a shared secret because a Cloud Run
+// Job has no Firebase user to present an ID token for.
+//
+// Every call is best-effort: a portal outage must never take down a capture that
+// is mid-sermon. Failures are logged and the run continues.
+async function callPortal(path: string, label: string): Promise<boolean> {
+  if (!PORTAL_URL || !INTERNAL_WEBHOOK_SECRET) {
+    console.log(`  [portal] ${label} skipped — PORTAL_URL / INTERNAL_WEBHOOK_SECRET not set`);
+    return false;
+  }
+  try {
+    const resp = await fetch(`${PORTAL_URL.replace(/\/$/, '')}${path}`, {
+      method: 'POST',
+      headers: { 'x-internal-secret': INTERNAL_WEBHOOK_SECRET },
+      signal: AbortSignal.timeout(PORTAL_TIMEOUT_MS),
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      console.error(`  [portal] ${label} → ${resp.status}: ${text.slice(0, 200)}`);
+      return false;
+    }
+    console.log(`  [portal] ${label} → ok: ${text.slice(0, 200)}`);
+    return true;
+  } catch (e) {
+    console.error(`  [portal] ${label} failed:`, e instanceof Error ? e.message : e);
+    return false;
+  }
 }
 
 async function main() {
@@ -396,7 +430,18 @@ async function main() {
   proc.stdout!.on('data', (chunk: Buffer) => {
     totalBytes += chunk.length;
     lastAudioReceivedAt = Date.now();
-    if (!firstAudioReceivedAt) firstAudioReceivedAt = lastAudioReceivedAt;
+    if (!firstAudioReceivedAt) {
+      firstAudioReceivedAt = lastAudioReceivedAt;
+      // HOOK 1 — audio is genuinely flowing, so this really is a live service.
+      // Deliberately NOT fired at job start: a scheduled run that finds no live
+      // stream must not WhatsApp the notulen. Fire-and-forget so the audio pipe
+      // is never blocked on an HTTP round trip.
+      if (WRITE_FIRESTORE) {
+        const { docId } = computeIdentity();
+        console.log('\n[hook] first audio received — requesting notetaker link send');
+        void callPortal(`/api/sermon-captures/${docId}/notify-notetaker`, 'notify-notetaker');
+      }
+    }
     try {
       session.sendRealtimeInput({
         audio: { data: chunk.toString('base64'), mimeType: 'audio/pcm;rate=16000' },
@@ -603,6 +648,13 @@ function finish(reason: string = 'unknown') {
           finalizedAt: new Date().toISOString(),
         }, { merge: true });
         console.log(`  ✓ Firestore: updated sermon_captures/${docId} → captured`);
+
+        // HOOK 2 — the capture is final and the summary is on the doc, so the
+        // portal can now combine with the notulen's notes and publish. AWAITED:
+        // the process exits right after, and an unawaited fetch would be killed
+        // mid-flight. The portal itself decides whether this publishes live or
+        // only drafts (see publish-chain route).
+        await callPortal(`/api/sermon-captures/${docId}/publish-chain`, 'publish-chain');
       } catch (e) {
         console.error('  ✗ Firestore write failed:', e instanceof Error ? e.message : e);
       }
