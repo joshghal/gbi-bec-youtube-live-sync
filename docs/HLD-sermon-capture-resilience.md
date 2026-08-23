@@ -119,13 +119,29 @@ pattern as the existing "Stop & Summarize" / "Regenerate Summary" buttons),
 backed by a new route `POST /api/sermon-captures/[id]/rerun`.
 
 **Mechanism:**
-- The button appears on any capture card where `status !== 'capturing'` and
-  `endedAt` is recent enough that the underlying YouTube broadcast might
-  still be live (heuristic: sermon date is today, or the doc's own
-  `videoId`, when re-checked via `liveStreamingDetails`, still reports no
-  `actualEndTime`). If the broadcast has already ended, the button is
-  disabled with a tooltip explaining why (re-running against an ended
-  broadcast can't recover more than a fresh capture could — see §6).
+- **Gated to a valid time window — two layers, cheap check first:**
+  1. *Render-time (client, no API call):* the button only appears active
+     when `now` falls inside `[capture.startedAt, capture.startedAt +
+     MAX_SERVICE_WINDOW_MS]`, where `MAX_SERVICE_WINDOW_MS` is a generous
+     ceiling well past the normal ~90-minute service (e.g. 3 hours, to
+     cover a service that runs long). Outside that window — including any
+     capture from a previous day — the button renders disabled with a
+     tooltip ("layanan ini kemungkinan sudah selesai — re-run tidak akan
+     mendapat lebih banyak konten"). This is a pure timestamp comparison,
+     computed from `capture.startedAt` already on the doc; no network call
+     needed just to decide whether to show an enabled button.
+  2. *Click-time (server, authoritative):* the time window is only a
+     heuristic — a service can end early or occasionally run past the
+     ceiling. So before the route actually calls the Cloud Run Jobs API, it
+     re-checks `liveStreamingDetails.actualEndTime` for the doc's `videoId`
+     via the YouTube Data API. If `actualEndTime` is present (broadcast has
+     genuinely ended), the route refuses with 409 even if the client-side
+     window said the button should be active — the time check is an
+     optimistic UI gate, the API check is the real guard against wasting a
+     Cloud Run execution and Gemini cost on a dead broadcast.
+  If the broadcast has already ended by either check, re-running can't
+  recover more than a fresh capture could — see §6 for why post-hoc re-runs
+  don't help.
 - On click, the route calls the **Cloud Run Jobs API**
   (`POST https://run.googleapis.com/v2/{job}:run`) to start a new execution
   of `gbi-bec-youtube-live-sync`, with an env-var override that skips the
