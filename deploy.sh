@@ -3,7 +3,13 @@
 #
 # Prerequisites (one-time):
 #   - GCS bucket "gbi-bec-sermon-captures" exists (deploy.sh creates it)
-#   - Secret Manager has "gemini-api-key" (already in place)
+#   - Secret Manager has "gemini-api-key", "youtube-api-key" (already in place —
+#     the latter powers the clean YouTube Data API discovery/poller path; without
+#     it the job silently falls back to HTML-scraping discovery and the Item-1
+#     poller-based finalize logic in live-summary.ts degrades to its silence-only
+#     fallback. --env-vars-file below REPLACES the full env list on every deploy,
+#     so any ad-hoc `--update-env-vars` addition not also added here gets wiped
+#     on the next run — that's exactly what silently dropped this key on 2026-08-23.)
 #   - Required env vars: ASI1_API_KEY
 #
 # Schedules (Asia/Jakarta = WIB):
@@ -65,7 +71,7 @@ gcloud run jobs create "$JOB_NAME" \
   --region "$REGION" \
   --project "$PROJECT_ID" \
   --env-vars-file "$ENV_FILE" \
-  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,WEBSHARE_TOKEN=webshare-api-token:latest,PROXIES=webshare-proxies:latest,/secrets/youtube-cookies.txt=youtube-cookies:latest" \
+  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,WEBSHARE_TOKEN=webshare-api-token:latest,PROXIES=webshare-proxies:latest,YOUTUBE_API_KEY=youtube-api-key:latest,/secrets/youtube-cookies.txt=youtube-cookies:latest" \
   --memory 2Gi \
   --cpu 2 \
   --max-retries 0 \
@@ -77,7 +83,7 @@ gcloud run jobs update "$JOB_NAME" \
   --region "$REGION" \
   --project "$PROJECT_ID" \
   --env-vars-file "$ENV_FILE" \
-  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,WEBSHARE_TOKEN=webshare-api-token:latest,PROXIES=webshare-proxies:latest,/secrets/youtube-cookies.txt=youtube-cookies:latest" \
+  --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,WEBSHARE_TOKEN=webshare-api-token:latest,PROXIES=webshare-proxies:latest,YOUTUBE_API_KEY=youtube-api-key:latest,/secrets/youtube-cookies.txt=youtube-cookies:latest" \
   --memory 2Gi \
   --cpu 2 \
   --max-retries 0 \
