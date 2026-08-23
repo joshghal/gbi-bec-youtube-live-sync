@@ -2,7 +2,8 @@
  * Live transcription + single-pass final summarization.
  *   audio → Gemini 3.1 Flash Live (transcribes) → transcript buffer (in-memory)
  *   every 60s: transcript snapshot → GCS (so admins can peek live)
- *   on stream end (or hard cap, or audio-silent watchdog):
+ *   on stream end (poller-confirmed, after a 30-min no-cut floor — or hard cap,
+ *   or, only if the poller is inconclusive, a long audio-silence fallback):
  *     transcript → Gemini 2.5 Pro (ONE call) → polished BEC-style catatan khotbah
  *     → GCS + Firestore
  *
@@ -46,7 +47,19 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL ?? 'gemini-3.1-flash-live-preview'
 const FINAL_SUMMARY_MODEL = process.env.FINAL_SUMMARY_MODEL ?? 'gemini-2.5-pro';  // one polished call at sermon end
 const MAX_DURATION_MS = parseInt(process.env.MAX_DURATION_MS ?? '240000', 10);  // 4 min default
 const TRANSCRIPT_UPLOAD_EVERY_MS = parseInt(process.env.TRANSCRIPT_UPLOAD_EVERY_MS ?? '60000', 10); // upload raw transcript snapshot to GCS every minute
-const SILENCE_WATCHDOG_MS = parseInt(process.env.SILENCE_WATCHDOG_MS ?? '60000', 10);  // finalize if no audio chunks in this window (after stream started)
+const SILENCE_WATCHDOG_MS = parseInt(process.env.SILENCE_WATCHDOG_MS ?? '60000', 10);  // last-resort fallback only — see MIN_CAPTURE_FLOOR_MS below
+// MIN_CAPTURE_FLOOR_MS: once real audio has been seen, nothing may finalize the
+// capture before this much time has passed — no matter what ffmpeg/the CDN does.
+// Added after Aug 23 2026 service 5: a mid-stream CDN edge switch produced a ~46s
+// wall of HTTP 403s on segment fetches, the silence watchdog read that as "stream
+// ended" at 64s in, and a full 88-minute sermon was cut down to a 129-char
+// transcript. Transient network blips must not be able to kill a capture this early.
+const MIN_CAPTURE_FLOOR_MS = parseInt(process.env.MIN_CAPTURE_FLOOR_MS ?? '1800000', 10);  // 30 min
+// After the floor, the real cutting signal is the YouTube Data API poller
+// (liveStreamingDetails.actualEndTime) — the actual source of truth for whether
+// the broadcast has ended, not a proxy for it via ffmpeg's audio flow.
+const LIVE_POLL_MS = parseInt(process.env.LIVE_POLL_MS ?? '60000', 10);
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY ?? '';
 const OUTPUT_DIR = process.env.OUTPUT_DIR ?? '/tmp';                            // per-run output dir
 const GCS_BUCKET = process.env.GCS_BUCKET;                                       // optional — uploads on finish
 const GCS_PREFIX = process.env.GCS_PREFIX ?? '';                                 // optional path prefix in bucket
@@ -182,6 +195,29 @@ function computeIdentity() {
     : `${basename(OUTPUT_DIR)}/transcript.txt`;
   const gcsTranscriptUri = GCS_BUCKET ? `gs://${GCS_BUCKET}/${remotePath}` : '';
   return { videoId, docId, gcsTranscriptUri };
+}
+
+// Poller cutting logic — asks YouTube directly whether THIS broadcast has ended
+// (liveStreamingDetails.actualEndTime), instead of inferring it from ffmpeg's
+// audio flow. Same YOUTUBE_API_KEY / videos.list endpoint sunday-runner.ts uses
+// for discovery — a clean server-to-server API call, no bot-detection surface,
+// no proxy needed. Returns:
+//   true  — confirmed still live
+//   false — confirmed ended (actualEndTime present) → safe to finalize
+//   null  — inconclusive (no key / API error / no liveStreamingDetails) → fail
+//           open, never finalize off an inconclusive answer.
+async function checkStreamStillLive(videoId: string): Promise<boolean | null> {
+  if (!YOUTUBE_API_KEY) return null;
+  try {
+    const r = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`);
+    if (!r.ok) return null;
+    const j = await r.json() as { items?: Array<{ liveStreamingDetails?: { actualEndTime?: string } }> };
+    const details = j.items?.[0]?.liveStreamingDetails;
+    if (!details) return null;
+    return !details.actualEndTime;
+  } catch {
+    return null;
+  }
 }
 
 // ── Portal callbacks ────────────────────────────────────────────────
@@ -484,19 +520,43 @@ async function main() {
     }
   }, TRANSCRIPT_UPLOAD_EVERY_MS);
 
-  // 3b. Audio-silent watchdog — finalize early if ffmpeg goes silent
-  //     (happens when broadcast ends but ffmpeg doesn't exit; HLS DVR retry loop).
-  //     Only triggers AFTER we've received some audio (firstAudioReceivedAt set).
-  const silenceCheckTimer = setInterval(() => {
+  // 3b. Post-floor cutting logic. Before MIN_CAPTURE_FLOOR_MS has elapsed since
+  //     first audio, nothing here finalizes — a transient CDN/proxy blip (segment
+  //     403s, a dropped connection, an HLS edge switch) must be allowed to just
+  //     keep retrying, not get mistaken for "the stream ended."
+  //
+  //     After the floor: ask YouTube directly (the poller) whether the broadcast
+  //     has actually ended, and finalize only on that confirmation. Raw audio
+  //     silence is kept as a last-resort fallback ONLY when the poller itself is
+  //     inconclusive (no API key / API error) — using a much longer window than
+  //     the old default, since its only job at that point is to stop an orphaned
+  //     process (e.g. June 21 service 4: ffmpeg not exiting after a dead manifest),
+  //     not to react to short-lived network hiccups.
+  const { videoId: capturedVideoId } = computeIdentity();
+  const FALLBACK_SILENCE_MS = Math.max(SILENCE_WATCHDOG_MS, 10 * 60_000);  // ≥10 min
+  const silenceCheckTimer = setInterval(async () => {
     if (finished || !firstAudioReceivedAt) return;
-    const silentMs = Date.now() - lastAudioReceivedAt;
-    if (silentMs > SILENCE_WATCHDOG_MS) {
-      console.log(`\n[watchdog] no audio for ${Math.round(silentMs / 1000)}s — stream likely ended, finalizing`);
+    if (Date.now() - firstAudioReceivedAt < MIN_CAPTURE_FLOOR_MS) return;  // still in the no-cut floor
+
+    const stillLive = await checkStreamStillLive(capturedVideoId);
+    if (stillLive === false) {
+      console.log(`\n[poller] YouTube reports broadcast ended — finalizing`);
       clearInterval(transcriptUploadTimer);
       clearInterval(silenceCheckTimer);
-      finish('audio-silent');
+      finish('poller-ended');
+      return;
     }
-  }, 15_000);
+
+    if (stillLive === null) {
+      const silentMs = Date.now() - lastAudioReceivedAt;
+      if (silentMs > FALLBACK_SILENCE_MS) {
+        console.log(`\n[watchdog] poller inconclusive + no audio for ${Math.round(silentMs / 1000)}s — finalizing`);
+        clearInterval(transcriptUploadTimer);
+        clearInterval(silenceCheckTimer);
+        finish('audio-silent-fallback');
+      }
+    }
+  }, LIVE_POLL_MS);
 
   // 3c. Manual stop check — admin can click "Stop & Summarize" in the portal,
   //     which sets stopRequested=true on the Firestore capture doc. We poll
