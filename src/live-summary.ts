@@ -280,6 +280,11 @@ async function main() {
         capturedAt: new Date().toISOString(),
         kabarId: null,
         createdAt: new Date().toISOString(),
+        // Cloud Run auto-injects this into every job execution — recorded so the
+        // admin portal can pull this run's own Cloud Logging entries on demand
+        // (see docs/HLD-sermon-capture-resilience.md, Item 4) without needing
+        // gcloud CLI access to trace an incident.
+        cloudRunExecutionName: process.env.CLOUD_RUN_EXECUTION ?? null,
       }, { merge: true });
       console.log(`  ✓ Firestore: registered sermon_captures/${docId} as 'capturing'`);
     } catch (e) {
