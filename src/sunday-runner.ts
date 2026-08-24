@@ -459,7 +459,44 @@ function rescheduleExistingOnRestart() {
   }
 }
 
+// Manual re-run escape hatch (HLD Item 3, docs/HLD-sermon-capture-resilience.md
+// in this repo): the admin portal already knows the exact videoId of a capture
+// it wants retried — polling to rediscover it is unnecessary and just adds a
+// delay. Distinct from FAKE_LIVE_NOW (that one only fires in the ALL-DAY
+// polling branch of main(), which the deployed Cloud Run job never takes,
+// since the scheduler always sets SERVICE_NUMBER — that branch is dead code
+// in production).
+async function startKnownVideoCapture(N: number, videoId: string, title: string): Promise<void> {
+  log(`TARGET_VIDEO_ID mode: capturing ${videoId} as service ${N} directly, no discovery`);
+  const svc: ServiceState = {
+    videoId,
+    title,
+    serviceNumber: N,
+    publishedAt: new Date().toISOString(),
+    scheduledStartAt: new Date().toISOString(),
+    status: 'detected',
+  };
+  state.services[videoId] = svc;
+  saveState();
+  startCapture(svc);
+  await new Promise<void>((resolve) => {
+    const wait = setInterval(() => {
+      if (svc.status === 'completed' || svc.status === 'failed') {
+        clearInterval(wait);
+        resolve();
+      }
+    }, 5000);
+  });
+  log(`Manual re-run done. Service ${N} status: ${svc.status}`);
+}
+
 async function singleServiceMode(N: number): Promise<void> {
+  const targetVideoId = process.env.TARGET_VIDEO_ID;
+  if (targetVideoId) {
+    await startKnownVideoCapture(N, targetVideoId, process.env.TARGET_VIDEO_TITLE ?? `[RE-RUN] Ibadah Raya ${N}`);
+    return;
+  }
+
   log(`SINGLE-SERVICE MODE: target service ${N}`);
   log(`Waiting up to ${WAIT_FOR_STREAM_TIMEOUT_MS / 60000} min for "Ibadah Raya ${N}" to appear live today (WIB)`);
   const deadline = Date.now() + WAIT_FOR_STREAM_TIMEOUT_MS;
