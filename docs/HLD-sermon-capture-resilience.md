@@ -1,6 +1,10 @@
 # HLD — Sermon Capture Resilience
 
-Status: draft. Item 1 is coded (uncommitted). Items 2–4 are design only, not built.
+Status: Item 1 deployed and stress-tested E2E. Item 2 confirmed pre-existing
+in code (pending human confirmation the WhatsApp alert actually reached the
+admin on the day of the incident). Item 4 implemented, tested against real
+production data, and deployed on both sides. Item 3 (manual re-run trigger)
+remains unbuilt — the last open item.
 
 ## 1. Problem
 
@@ -192,10 +196,14 @@ used for the transcript/summary tabs), backed by a new route
   (`entries.list`) filtered to
   `resource.type="cloud_run_job" AND resource.labels.job_name="gbi-bec-youtube-live-sync"
   AND labels."run.googleapis.com/execution_name"="<cloudRunExecutionName>"`,
-  ordered ascending, capped at the last 30 minutes of that execution's
-  activity (or its full span if shorter — most executions are well under
-  30 min of log volume, as seen in today's incident: ~100 lines for a full
-  2-minute failed run).
+  ordered ascending, windowed to 30 minutes **starting from the execution's
+  own start time** (the capture doc's `capturedAt`), not from wall-clock
+  "now." Anchoring to "now" was the original implementation and was wrong —
+  caught by testing against a real day-old execution: it silently returned
+  zero results, since incident review normally happens well after the
+  30-minute mark from "now," not during it. Fixed and re-verified: 100/100
+  entries correctly returned for that same execution once anchored to its
+  actual start time.
 - Explicitly **not** a live tail — one request, one snapshot, rendered as a
   read-only scrollable log panel. No websocket, no polling, no
   auto-refresh. Matches what was actually asked for: "a logger that would
@@ -217,15 +225,21 @@ credentialed, CLI-based process — which is why it took this long to trace
 today's. This closes that gap for whoever is on call, admin-authenticated,
 no CLI required.
 
-**New IAM requirement:** the portal's service account needs
-`roles/logging.viewer` (or a custom role scoped to
-`logging.logEntries.list`) — it currently has neither (confirmed during
-this investigation: the Firebase Admin SDK service account got
-`PERMISSION_DENIED` on both Secret Manager and, by the same pattern, would
-on Logging).
+**IAM:** turned out to need nothing new. The service account already holds
+`roles/editor` at the project level, and unlike Secret Manager (which Google
+deliberately fences off even from Editor, confirmed via a real
+`PERMISSION_DENIED` earlier in this investigation), Cloud Logging read access
+is not similarly fenced — verified directly via the actual REST call this
+code makes, authenticated as the real service account, no additional grant
+needed. The original HLD draft assumed otherwise by analogy with the Secret
+Manager case; that assumption was untested and wrong.
 
 **Data model change:** `sermon_captures/{docId}.cloudRunExecutionName:
 string`.
+
+**Status:** implemented and deployed on both sides (`gbi-bec-youtube-live-sync`
+writes the field; `gbi-bec-portal` serves the panel). Verified end-to-end
+against a real production incident's logs.
 
 ---
 
