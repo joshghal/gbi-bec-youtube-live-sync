@@ -1,10 +1,14 @@
 # HLD — Sermon Capture Resilience
 
-Status: Item 1 deployed and stress-tested E2E. Item 2 confirmed pre-existing
-in code (pending human confirmation the WhatsApp alert actually reached the
-admin on the day of the incident). Item 4 implemented, tested against real
-production data, and deployed on both sides. Item 3 (manual re-run trigger)
-remains unbuilt — the last open item.
+Status: all four items implemented and deployed. Item 1 stress-tested E2E
+(poller unit tests, real silence-simulation, concurrency). Item 2 confirmed
+pre-existing in code (pending human confirmation the WhatsApp alert actually
+reached the admin on the day of the incident — the one item that needs a
+person, not a test, to close out). Item 4 tested against real production
+data, including a real bug the testing itself caught and fixed (see §5).
+Item 3 built, and tested live against the real deployed job — see §4 for a
+mistake made and caught along the way (first live test ran against a stale
+image, wasted ~10 min of real compute before being caught and cancelled).
 
 ## 1. Problem
 
@@ -147,13 +151,18 @@ backed by a new route `POST /api/sermon-captures/[id]/rerun`.
   recover more than a fresh capture could — see §6 for why post-hoc re-runs
   don't help.
 - On click, the route calls the **Cloud Run Jobs API**
-  (`POST https://run.googleapis.com/v2/{job}:run`) to start a new execution
-  of `gbi-bec-youtube-live-sync`, with an env-var override that skips the
-  normal "wait up to 30 min for the stream to appear" discovery step and
-  jumps straight to capturing the *known* `videoId` from the failed doc —
-  the discovery-bypass mechanism (`FAKE_LIVE_NOW=<videoId>:<serviceN>`)
-  already exists in `sunday-runner.ts` for local testing; this reuses the
-  same escape hatch in production instead of adding a new one.
+  (`POST .../v1/namespaces/{project}/jobs/{job}:run`, the same v1 shape
+  deploy.sh's own Cloud Scheduler entries use) to start a new execution of
+  `gbi-bec-youtube-live-sync`, with a `TARGET_VIDEO_ID` env-var override that
+  skips discovery entirely and captures the *known* `videoId` directly.
+  This required a small backend addition (`sunday-runner.ts@41d9d6d`) — the
+  original plan was to reuse `FAKE_LIVE_NOW`, but reading the code showed
+  that mechanism only fires in the ALL-DAY polling branch of `main()`, which
+  the deployed job never takes (the Cloud Scheduler always sets
+  `SERVICE_NUMBER`, forcing the `singleServiceMode` branch, which had no
+  direct-videoId override until `TARGET_VIDEO_ID` was added). Caught by
+  reading the code before building the portal side around a false
+  assumption, not by testing it live first.
 - Because `sermon_captures` docIds are deterministic
   (`{date}-service-{N}-{videoId}`, see `computeIdentity()`), the new
   execution naturally overwrites the same Firestore doc and GCS paths — no
@@ -172,10 +181,30 @@ service, with 85 minutes still to go, makes the re-run button genuinely
 useful. An alert that arrives after the fact (today's case) does not — see
 §6 for why this doesn't help post-hoc.
 
-**New IAM requirement:** the portal's service account needs
-`roles/run.developer` (or a custom role scoped to
-`run.jobs.run`) on the Cloud Run job, in addition to its existing Firestore
-access.
+**IAM:** turned out to need nothing new here either, same pattern as Item 4 —
+the service account's existing `roles/editor` already covers `run.jobs.run`.
+Verified directly: the first live trigger call succeeded on the first try,
+no permission error. (The thing that *did* go wrong on that first live test
+was unrelated to IAM — see below.)
+
+**Status:** implemented and deployed on both sides. Tested live against the
+real deployed job — with one mistake made and caught along the way, worth
+recording plainly: the backend (`TARGET_VIDEO_ID`) was tested locally via
+`tsx` and worked, then the portal trigger route was built and live-tested
+directly against the real Cloud Run job — without redeploying the engine
+first. That first live test silently ran against the *old* image (predating
+`TARGET_VIDEO_ID`), fell through to normal discovery, and started polling
+for a nonexistent service every 60 seconds — it would have burned a full
+30 minutes of real compute had the logs not been checked directly instead
+of assuming success from "the API call returned 200." Cancelled via
+`gcloud run jobs executions delete`, confirmed nothing left running,
+redeployed with the current code, reran the test: `TARGET_VIDEO_ID` mode
+fired correctly, discovery was skipped, and the container exited cleanly.
+(That second run's actual capture failed for an unrelated, pre-existing
+reason — a yt-dlp bot-detection error on that specific proxy/cookie
+combination — but the orchestrator handled the failure correctly: marked
+the service `failed`, logged it, exited with no hang. The re-run mechanism
+itself is what was under test, and it passed.)
 
 ---
 
@@ -260,19 +289,19 @@ notes.
 
 ---
 
-## 7. Rollout order
+## 7. Rollout order (as planned, then as it actually went)
 
-1. **Item 1** — no new infra, no new IAM, already coded. Deploy first;
-   lowest risk, highest immediate value (directly prevents recurrence of
-   today's exact failure mode).
-2. **Item 2** — no new IAM (reuses existing WhatsApp send path), small
-   logic addition to an existing hook. Deploy second.
-3. **Item 4** — needs one new IAM grant (`logging.viewer`) and one new
-   Firestore field written by the job. Deploy third; unblocks fast
-   diagnosis of whatever Item 1/2 didn't fully catch.
-4. **Item 3** — needs a second new IAM grant (`run.developer`) and is the
-   most operationally sensitive (it starts paid Cloud Run + Gemini work on
-   admin action). Deploy last, once 1/2/4 have proven out — a re-run button
-   is most valuable *combined with* fast alerting (Item 2) and log-based
-   diagnosis (Item 4) already in place, so build it after them rather than
-   in isolation.
+Planned: 1 → 2 → 4 → 3, on the theory that 4 (diagnosis) should land before
+3 (an operationally sensitive action that spends real cost) so the two
+IAM-gated items would prove out independently before combining.
+
+As built: 1 → (2 found to already exist, no build needed) → 4 → 3, in that
+order — matching the plan once 2 turned out to be a no-op. Both 3 and 4
+turned out to need **no new IAM grants at all** (the assumed
+`roles/logging.viewer` and `roles/run.developer` requirements were both
+untested guesses, made by analogy with Secret Manager's real fencing —
+`roles/editor` already covered both). That assumption was wrong in a way
+that would have blocked nothing in practice, but it's worth remembering the
+lesson generally: verify an IAM assumption against the actual call before
+designing around it, rather than reasoning from a different service's
+behavior.
