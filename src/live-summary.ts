@@ -349,9 +349,15 @@ async function main() {
   //    - web client + cookies + Deno (GCP-IP path — the one that actually works on Cloud Run).
   // Cookies secret is mounted read-only at /secrets/youtube-cookies.txt — copy to /tmp
   // because yt-dlp writes session updates back to the cookie file.
+  // Client mode is chosen PER ATTEMPT below, not globally — proxy (residential)
+  // legs use android+no-cookies, the direct/GCP-IP leg uses web+cookies. Both
+  // used to collapse onto web+cookies for every leg (including all 25 proxy
+  // sessions) because this was a single global switch keyed only on whether
+  // cookiesSrc was set — which is now always, since the secret is always
+  // mounted. That silently disabled the android path the proxy legs actually
+  // need, which is the likely cause of the Sep 2026 all-sessions-fail incident.
   const cookiesSrc = process.env.YOUTUBE_COOKIES_PATH;
   let cookiesArg: string[] = [];
-  let extractorArgs: string[] = ['--extractor-args', 'youtube:player_client=android'];  // default: no cookies → android
   console.log(`[yt-dlp] cookiesSrc env = ${cookiesSrc ?? '(unset)'}`);
   if (cookiesSrc) {
     const { copyFileSync, existsSync, statSync } = await import('node:fs');
@@ -360,12 +366,12 @@ async function main() {
     try {
       copyFileSync(cookiesSrc, cookiesDest);
       cookiesArg = ['--cookies', cookiesDest];
-      extractorArgs = [];   // cookies path uses default web client + Deno; android rejects cookies
-      console.log(`[yt-dlp] cookies copied to ${cookiesDest}, will use --cookies`);
+      console.log(`[yt-dlp] cookies copied to ${cookiesDest}, will use --cookies on the direct leg`);
     } catch (e) {
-      console.warn('  ⚠ cookies copy failed, falling back to android client:', e instanceof Error ? e.message : e);
+      console.warn('  ⚠ cookies copy failed, direct leg will fall back to android client too:', e instanceof Error ? e.message : e);
     }
   }
+  const androidArgs: string[] = ['--extractor-args', 'youtube:player_client=android']; // no cookies — android rejects them
   // Proxy fallback chain: YouTube bot-detects ALL datacenter IPs at the
   // youtubei/v1/player layer. We use Webshare ROTATING RESIDENTIAL via their
   // backbone gateway p.webshare.io:80 — each session-N username routes to a
@@ -401,19 +407,23 @@ async function main() {
     if (proxyList.length > 0) console.log(`[proxy] using ${proxyList.length} static PROXIES from env`);
   }
   const proxyAttempts: (string | null)[] = proxyList.length > 0 ? [...proxyList, null] : [null];
-  const baseArgs = ['--no-update', '--quiet', '--no-warnings', ...extractorArgs, ...cookiesArg, '-f', '91', '--get-url', URL!];
+  const baseFlags = ['--no-update', '--quiet', '--no-warnings', '-f', '91', '--get-url', URL!];
 
   let m3u8Url = '';
   let workingProxyUrl: string | null = null;
   let lastErr = '';
   for (const proxyEntry of proxyAttempts) {
-    let args = baseArgs;
     let label = 'direct';
     let proxyUrl: string | null = null;
+    // proxy (residential) leg → android, no cookies; direct (GCP-IP) leg →
+    // web + cookies if we have them, else android as last resort.
+    const clientArgs = proxyEntry ? androidArgs : (cookiesArg.length > 0 ? [] : androidArgs);
+    const authArgs = proxyEntry ? [] : cookiesArg;
+    let args = [...baseFlags, ...clientArgs, ...authArgs];
     if (proxyEntry) {
       const [host, port, user, pass] = proxyEntry.split(':');
       proxyUrl = `http://${user}:${pass}@${host}:${port}`;
-      args = ['--proxy', proxyUrl, ...baseArgs];
+      args = ['--proxy', proxyUrl, ...args];
       label = `${host}:${port}`;
     }
     console.log(`[yt-dlp] attempt via ${label} — cmd: yt-dlp ${args.join(' ').replace(/[A-Za-z0-9_/.-]+yt-cookies\.txt/g, '<cookies>').replace(/http:\/\/[^@]+@/g, 'http://<creds>@')}`);
@@ -729,5 +739,44 @@ function finish(reason: string = 'unknown') {
 }
 
 process.on('SIGINT', () => finish('sigint'));
+// Cloud Run sends SIGTERM on `executions cancel` and on its own container
+// lifecycle termination (not SIGINT) — without this handler those paths skip
+// finish() entirely and leave the Firestore doc stuck at 'capturing' forever,
+// same symptom as the no-markFatal fatal-error gap this fixed alongside.
+process.on('SIGTERM', () => finish('sigterm'));
 
-main().catch((e) => { console.error('Fatal:', e); process.exit(1); });
+// Last-resort safety net: if anything throws BEFORE the capture ever gets far
+// enough to reach finish() (e.g. every yt-dlp manifest-fetch attempt fails —
+// this is a real failure seen on 2026-08-30, "Sign in to confirm you're not a
+// bot" across all proxy sessions), the previous behavior was to log to
+// console and exit — leaving the Firestore doc permanently stuck at
+// status:'capturing' with no live process left to ever change that. Stop &
+// Summarize can't fix it either, since it only signals an engine that no
+// longer exists. Mirrors finish()'s own Firestore-write shape so the admin
+// UI renders this the same way it renders any other failed capture, and
+// still triggers publish-chain so Item 2's alerting fires on this path too
+// (see sermon-publish-chain.ts's status guard, widened to accept 'failed').
+async function markFatal(error: unknown): Promise<void> {
+  if (!WRITE_FIRESTORE) return;
+  try {
+    if (!getApps().length) initializeApp({ credential: applicationDefault() });
+    const db = getFirestore();
+    const { docId } = computeIdentity();
+    await db.collection('sermon_captures').doc(docId).set({
+      status: 'failed',
+      endReason: 'fatal-error',
+      fatalError: error instanceof Error ? error.message : String(error),
+      finalizedAt: new Date().toISOString(),
+    }, { merge: true });
+    console.log(`  ✓ Firestore: marked sermon_captures/${docId} → failed (fatal error, never reached finish())`);
+    await callPortal(`/api/sermon-captures/${docId}/publish-chain`, 'publish-chain (fatal path)');
+  } catch (e) {
+    console.error('  ✗ markFatal Firestore write failed:', e instanceof Error ? e.message : e);
+  }
+}
+
+main().catch(async (e) => {
+  console.error('Fatal:', e);
+  await markFatal(e);
+  process.exit(1);
+});
